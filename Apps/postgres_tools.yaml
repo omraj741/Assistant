@@ -1,0 +1,19 @@
+kind: source
+name: postgres-source
+type: postgres
+host: ${POSTGRES_HOST}
+port: ${POSTGRES_PORT}
+database: ${POSTGRES_DATABASE}
+user: ${POSTGRES_USER}
+password: ${POSTGRES_PASSWORD}
+---
+kind: tool
+name: execute_sql
+type: postgres-execute-sql
+source: postgres-source
+description: Execute a PostgreSQL statement requested by the trusted developer.
+---
+kind: toolset
+name: postgres-toolset
+tools:
+  - execute_sql

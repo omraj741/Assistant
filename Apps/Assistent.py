@@ -9,12 +9,18 @@ import time
 import uuid
 from dataclasses import dataclass
 from typing import Any
+from aiohttp import ClientError
 from langchain_core.tools import tool
 from langchain.tools import ToolRuntime
 import streamlit as st
 from langchain_groq import ChatGroq
 from langchain.agents import create_agent
 from langgraph.checkpoint.memory import MemorySaver
+from toolbox_langchain import ToolboxClient
+
+
+TOOLBOX_URL = os.getenv("TOOLBOX_URL", "http://127.0.0.1:5000")
+TOOLSET_NAME = "postgres-toolset"
 
 
 @dataclass
@@ -152,7 +158,7 @@ def _get_weather_at_coordinates(latitude: float, longitude: float, place: str) -
 
 
 @st.cache_data(ttl=86400, max_entries=256)
-def _get_city_from_coordinates(latitude: float, longitude: float) -> str:
+def _get_city_name_from_coordinates(latitude: float, longitude: float) -> str | None:
     global _NOMINATIM_LAST_REQUEST
 
     latitude = round(latitude, 4)
@@ -187,14 +193,21 @@ def _get_city_from_coordinates(latitude: float, longitude: float) -> str:
         None,
     )
     if not city:
-        return "I couldn't determine a city name for your current location."
+        return None
 
     parts = [city]
     for key in ("state", "country"):
         value = address.get(key)
         if value and value not in parts:
             parts.append(value)
-    return f"Your approximate city is {', '.join(parts)}."
+    return ", ".join(parts)
+
+
+def _get_city_from_coordinates(latitude: float, longitude: float) -> str:
+    city_name = _get_city_name_from_coordinates(latitude, longitude)
+    if not city_name:
+        return "I couldn't determine a city name for your current location."
+    return f"Your approximate city is {city_name}."
 
 
 @tool
@@ -304,24 +317,32 @@ def _asks_for_city_name(query: str) -> bool:
 
 
 @st.cache_resource
+def create_toolbox_client() -> ToolboxClient:
+    return ToolboxClient(TOOLBOX_URL)
+
+
+@st.cache_resource
 def create_qna_agent():
+    postgres_tools = create_toolbox_client().load_toolset(TOOLSET_NAME)
     return create_agent(
         model=ChatGroq(model="openai/gpt-oss-20b"),
-        tools=[search_google, get_weather],
+        tools=[search_google, get_weather, *postgres_tools],
         checkpointer=MemorySaver(),
         context_schema=LocationContext,
         system_prompt=(
             "You are a helpful assistant that can search Google and provide current weather "
             "using the weather tool. For weather requests without a named city, call get_weather "
             "without a city so it uses the user's browser location. Ask for a city only if current "
-            "location is unavailable. Never invent weather conditions."
+            "location is unavailable. Never invent weather conditions. For PostgreSQL questions, "
+            "use the execute_sql tool and PostgreSQL syntax. Never claim a database operation "
+            "succeeded unless the tool confirms it. Before destructive operations, explain the "
+            "effect and ask the user to confirm."
         ),
     )
 
 
-agent = create_qna_agent()
-
 st.title("I'm your personal assistant")
+st.caption("PostgreSQL requests use MCP Toolbox; keep the Toolbox server running.")
 
 _LOCATION_KEY = "browser_location"
 _location_state = st.session_state.get(_LOCATION_KEY, {})
@@ -339,10 +360,22 @@ _location_result = _LOCATION_COMPONENT(
 )
 _coordinates = _location_result.coordinates or _location_state.get("coordinates")
 if isinstance(_coordinates, dict):
-    st.caption(
-        f"Browser location detected: {_coordinates['latitude']:.4f}, "
-        f"{_coordinates['longitude']:.4f}. Coordinates are sent to Open-Meteo for weather."
+    city_name = _get_city_name_from_coordinates(
+        _coordinates["latitude"],
+        _coordinates["longitude"],
     )
+    if city_name:
+        st.caption(
+            f"Browser location detected: {city_name}. "
+            "Coordinates are sent to OpenStreetMap Nominatim to find the city; "
+            "Open-Meteo is used when you ask for weather."
+        )
+    else:
+        st.caption(
+            "Browser location detected, but the city name is unavailable. "
+            "Coordinates are sent to OpenStreetMap Nominatim to find the city; "
+            "Open-Meteo is used when you ask for weather."
+        )
 elif _location_state.get("error"):
     st.warning(
         f"Browser location unavailable: {_location_state['error']}. "
@@ -411,6 +444,16 @@ if query:
                 "browser, or ask about a city by name."
             )
     else:
+        try:
+            agent = create_qna_agent()
+        except ClientError as error:
+            st.error(
+                f"Could not load tools from MCP Toolbox at {TOOLBOX_URL}. "
+                "Start the Toolbox server and try again. "
+                f"Details: {error}"
+            )
+            st.stop()
+
         result = agent.invoke(
             {"messages": [{"role": "user", "content": query}]},
             {"configurable": {"thread_id": st.session_state.thread_id}},
